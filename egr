@@ -1,0 +1,1811 @@
+--[[
+	Penablox recode :: client toolkit
+	Structure + game API paths modelled on the shitaro hub source
+	(pastefy.app/iWmagcHQ -- Components/Weapon, Controllers/CameraController,
+	Database/Security/Remotes, workspace.GameState attributes, Combatants folders).
+
+	Everything resolves lazily and fails closed: a missing module disables its
+	feature instead of erroring the whole script.
+
+	Menu: INSERT
+]]
+
+if _G.__pena_toolkit then
+	pcall(function()
+		_G.__pena_toolkit.unload()
+	end)
+end
+
+--=============================================================
+-- services
+--=============================================================
+local function service(name)
+	local ok, s = pcall(game.GetService, game, name)
+	if ok and s then
+		return s
+	end
+	return nil
+end
+
+local Players      = service("Players")
+local RunService   = service("RunService")
+local UserInput    = service("UserInputService")
+local Replicated   = service("ReplicatedStorage")
+local Workspace    = service("Workspace")
+local HttpService  = service("HttpService")
+local TweenService = service("TweenService")
+local CoreGui      = service("CoreGui")
+local Debris       = Workspace:FindFirstChild("Debris")
+
+local LocalPlayer = Players.LocalPlayer
+
+local function cam()
+	return Workspace.CurrentCamera
+end
+
+-- executor globals, all optional
+local hookfn      = rawget(getfenv(), "hookfunction") or rawget(getfenv(), "replaceclosure")
+local mouse1click = rawget(getfenv(), "mouse1click")
+local writefile_  = rawget(getfenv(), "writefile")
+local readfile_   = rawget(getfenv(), "readfile")
+local isfile_     = rawget(getfenv(), "isfile")
+local makefolder_ = rawget(getfenv(), "makefolder")
+local isfolder_   = rawget(getfenv(), "isfolder")
+
+--=============================================================
+-- tiny utils
+--=============================================================
+local function try(fn, ...)
+	local ok, a, b = pcall(fn, ...)
+	if ok then
+		return a, b
+	end
+	return nil
+end
+
+local clamp = math.clamp or function(v, a, b)
+	if v < a then return a end
+	if v > b then return b end
+	return v
+end
+
+local function round(v)
+	return math.floor(v + 0.5)
+end
+
+--=============================================================
+-- flags
+--=============================================================
+local Flags = {
+	-- aim
+	aim = false,
+	aimKey = nil,
+	aimFov = 110,
+	aimSmooth = 6,
+	aimHitPart = "Head",
+	aimTeamCheck = true,
+	aimVisible = true,
+	aimPrediction = 0.11,
+	-- trigger
+	trigger = false,
+	triggerDelay = 0.03,
+	triggerFov = 12,
+	-- combat
+	nospread = false,
+	wallbang = false,
+	infammo = false,
+	-- movement
+	bhop = false,
+	speed = false,
+	speedValue = 22,
+	antiaim = false,
+	aaYaw = 35,
+	aaPitch = 12,
+	-- visuals
+	esp = false,
+	espBox = true,
+	espName = true,
+	espHealth = true,
+	espDistance = true,
+	espMaxDist = 900,
+	showFov = true,
+	showLogs = true,
+}
+
+--=============================================================
+-- replicated module layer (mirrors shitaro's D.j table)
+--=============================================================
+local G = {
+	ok = {},
+}
+
+local function waitPath(...)
+	local node = Replicated
+	for i = 1, select("#", ...) do
+		local name = select(i, ...)
+		local child = try(function()
+			return node:WaitForChild(name, 4)
+		end)
+		if not child then
+			return nil
+		end
+		node = child
+	end
+	return node
+end
+
+local function loadModule(...)
+	local inst = waitPath(...)
+	if not inst or not inst:IsA("ModuleScript") then
+		return nil
+	end
+	local res = try(require, inst)
+	if res == nil then
+		return nil
+	end
+	return res
+end
+
+local function probe(name, fn)
+	local v = try(fn)
+	G[name] = v
+	G.ok[name] = v ~= nil
+	return v
+end
+
+probe("weapon",      function() return loadModule("Components", "Weapon") end)
+probe("bullet",      function() return loadModule("Components", "Weapon", "Classes", "Bullet") end)
+probe("raycast",     function() return loadModule("Shared", "Raycast") end)
+probe("rayIgnore",   function() return loadModule("Components", "Common", "GetRayIgnore") end)
+probe("remotes",     function() return loadModule("Database", "Security", "Remotes") end)
+probe("cameraCtrl",  function() return loadModule("Controllers", "CameraController") end)
+probe("inventory",   function() return loadModule("Controllers", "InventoryController") end)
+probe("data",        function() return loadModule("Controllers", "DataController") end)
+probe("pose",        function() return loadModule("Components", "Common", "CharacterPose") end)
+probe("charVel",     function() return loadModule("Components", "Common", "GetCharacterVelocity") end)
+probe("charResolver",function() return loadModule("Components", "Common", "CharacterResolver") end)
+probe("weaponProps", function() return loadModule("Components", "Common", "GetWeaponProperties") end)
+probe("kinematics",  function() return loadModule("MovementV2", "RuntimeKinematics") end)
+probe("constants",   function() return loadModule("Database", "Custom", "Constants") end)
+
+local function gameState()
+	return Workspace:GetAttribute("GameState")
+end
+
+local function gamemode()
+	return Workspace:GetAttribute("Gamemode")
+end
+
+local function inBuyPeriod()
+	return gameState() == "Buy Period"
+end
+
+--=============================================================
+-- character / target layer
+--=============================================================
+local Targets = {}
+
+local HIT_PARTS = {
+	Head = { "Head" },
+	Torso = { "UpperTorso", "Torso", "LowerTorso", "HumanoidRootPart" },
+	Nearest = { "Head", "UpperTorso", "Torso", "LowerTorso", "HumanoidRootPart" },
+}
+
+local function rootOf(model)
+	local root = model:FindFirstChild("HumanoidRootPart")
+	if root and root:IsA("BasePart") then
+		return root
+	end
+	root = model.PrimaryPart
+	if root then
+		return root
+	end
+	return nil
+end
+
+local function alive(model)
+	if not model or not model.Parent then
+		return false
+	end
+	if model:GetAttribute("Dead") == true then
+		return false
+	end
+	local hp = model:GetAttribute("Health")
+	if type(hp) == "number" and hp <= 0 then
+		return false
+	end
+	local hum = model:FindFirstChildOfClass("Humanoid")
+	if hum and hum.Health <= 0 then
+		return false
+	end
+	return true
+end
+
+local function selfChar()
+	local char = LocalPlayer.Character
+	if char and char.Parent and rootOf(char) and alive(char) then
+		return char
+	end
+	return nil
+end
+
+local function myTeam()
+	local team = LocalPlayer:GetAttribute("Team")
+	if team then
+		return team
+	end
+	local char = selfChar()
+	return char and char:GetAttribute("Team") or nil
+end
+
+local function isEnemy(team, plr)
+	if plr == LocalPlayer then
+		return false
+	end
+	if gamemode() == "Deathmatch" then
+		return true
+	end
+	if not Flags.aimTeamCheck then
+		return true
+	end
+	local mine = myTeam()
+	if not mine or not team then
+		return false
+	end
+	return team ~= mine
+end
+
+-- one pass over the character containers, indexed by CombatantId and UserId
+local function indexCharacters()
+	local byId, byUser = {}, {}
+	for _, folderName in ipairs({ "Characters", "_PVS_CulledCharacters" }) do
+		local folder = Workspace:FindFirstChild(folderName)
+		if folder then
+			for _, model in ipairs(folder:GetChildren()) do
+				if model:IsA("Model") then
+					local id = model:GetAttribute("CombatantId")
+					if id ~= nil then
+						byId[id] = model
+					end
+					local uid = model:GetAttribute("UserId")
+					if uid ~= nil then
+						byUser[uid] = model
+					end
+				end
+			end
+		end
+	end
+	return byId, byUser
+end
+
+function Targets.list()
+	local out = {}
+	local seen = {}
+	local byId, byUser = indexCharacters()
+
+	local holders = Replicated:FindFirstChild("Combatants") or Workspace:FindFirstChild("Combatants")
+	if holders then
+		for _, holder in ipairs(holders:GetChildren()) do
+			local id = holder:GetAttribute("CombatantId")
+			local model = id ~= nil and byId[id] or nil
+			if not model then
+				local uid = holder:GetAttribute("UserId")
+				model = uid ~= nil and byUser[uid] or nil
+			end
+			if model and not seen[model] and alive(model) then
+				local team = model:GetAttribute("Team") or holder:GetAttribute("Team")
+				local uid = model:GetAttribute("UserId") or holder:GetAttribute("UserId")
+				local plr = uid and Players:GetPlayerByUserId(tonumber(uid) or -1) or nil
+				if isEnemy(team, plr) then
+					seen[model] = true
+					local label = holder:GetAttribute("DisplayName")
+						or model:GetAttribute("DisplayName")
+						or (plr and plr.Name)
+						or model.Name
+					out[#out + 1] = { model = model, plr = plr, name = tostring(label) }
+				end
+			end
+		end
+	end
+
+	-- standard players, for lobbies that still parent characters under the player
+	for _, plr in ipairs(Players:GetPlayers()) do
+		local char = plr.Character
+		if char and not seen[char] and alive(char) and isEnemy(char:GetAttribute("Team") or plr:GetAttribute("Team"), plr) then
+			seen[char] = true
+			out[#out + 1] = { model = char, plr = plr, name = plr.Name }
+		end
+	end
+	return out
+end
+
+local function hitPart(model, mode)
+	local list = HIT_PARTS[mode] or HIT_PARTS.Head
+	for _, name in ipairs(list) do
+		local part = model:FindFirstChild(name)
+		if part and part:IsA("BasePart") then
+			return part
+		end
+	end
+	return rootOf(model)
+end
+
+local function velocityOf(model, part)
+	if type(G.charVel) == "function" then
+		local v = try(G.charVel, model)
+		if typeof(v) == "Vector3" then
+			return v
+		end
+	end
+	if part then
+		return part.AssemblyLinearVelocity
+	end
+	return Vector3.zero
+end
+
+local function characterParts()
+	local set = {}
+	for _, plr in ipairs(Players:GetPlayers()) do
+		local char = plr.Character
+		if char then
+			set[#set + 1] = char
+		end
+	end
+	for _, name in ipairs({ "Characters", "_PVS_CulledCharacters", "Debris" }) do
+		local f = Workspace:FindFirstChild(name)
+		if f then
+			set[#set + 1] = f
+		end
+	end
+	if Debris then
+		set[#set + 1] = Debris
+	end
+	return set
+end
+
+local function lineOfSight(part, targetModel)
+	if not Flags.aimVisible then
+		return true
+	end
+	local filter = {}
+	for _, inst in ipairs(characterParts()) do
+		if inst ~= targetModel then
+			filter[#filter + 1] = inst
+		end
+	end
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = filter
+	params.IgnoreWater = true
+	local camera = cam()
+	if not camera then
+		return true
+	end
+	local origin = camera.CFrame.Position
+	local hit = Workspace:Raycast(origin, part.Position - origin, params)
+	if not hit then
+		return true
+	end
+	return hit.Instance and hit.Instance:IsDescendantOf(targetModel)
+end
+
+--=============================================================
+-- hook helpers
+--=============================================================
+local Restores = {}
+
+local function addRestore(fn)
+	Restores[#Restores + 1] = fn
+end
+
+--=============================================================
+-- nospread : zero the random() bias the spread cone is built from
+--=============================================================
+local NoSpread = { enabled = false, orig = nil }
+
+function NoSpread.enable()
+	if NoSpread.enabled then
+		return true
+	end
+	if type(hookfn) ~= "function" then
+		return false
+	end
+	local ok, orig = pcall(hookfn, math.random, function(a, b, c)
+		if NoSpread.enabled then
+			if a == nil then
+				return 0.5
+			elseif b == nil then
+				return 1
+			else
+				return math.floor((a + b) / 2 + 0.5)
+			end
+		end
+		if NoSpread.orig then
+			return NoSpread.orig(a, b, c)
+		end
+		return 0
+	end)
+	if not ok or type(orig) ~= "function" then
+		return false
+	end
+	NoSpread.orig = orig
+	NoSpread.enabled = true
+	addRestore(function()
+		NoSpread.enabled = false
+		pcall(hookfn, math.random, orig)
+	end)
+	return true
+end
+
+function NoSpread.disable()
+	NoSpread.enabled = false
+end
+
+--=============================================================
+-- infinite ammo : wrap ammo-ish members of the inventory/weapon modules
+--=============================================================
+local InfAmmo = { enabled = false, installed = false, hooked = 0 }
+
+local AMMO_PATTERN = "ammo"
+
+local function ammoFactory(name, orig)
+	return function(...)
+		local r = orig(...)
+		if not InfAmmo.enabled then
+			return r
+		end
+		if type(r) == "number" then
+			return math.huge
+		end
+		return r
+	end
+end
+
+function InfAmmo.install()
+	if type(hookfn) ~= "function" then
+		return 0
+	end
+	if InfAmmo.installed then
+		return InfAmmo.hooked
+	end
+	InfAmmo.installed = true
+	local total = 0
+	for _, mod in ipairs({ G.inventory, G.weapon, G.bullet }) do
+		if type(mod) == "table" then
+			for key, value in pairs(mod) do
+				if type(value) == "function" and type(key) == "string" and key:lower():find(AMMO_PATTERN) then
+					local ok, orig = pcall(hookfn, value, ammoFactory(key, value))
+					if ok and type(orig) == "function" then
+						total += 1
+						addRestore(function()
+							pcall(hookfn, value, orig)
+						end)
+					end
+				end
+			end
+		end
+	end
+	InfAmmo.hooked = total
+	return total
+end
+
+--=============================================================
+-- wallbang : bullet rays ignore non-character geometry
+--=============================================================
+local Wallbang = { enabled = false, installed = false, hooked = 0 }
+
+local function isCharacterInstance(inst)
+	local model = inst:FindFirstAncestorOfClass("Model")
+	return model ~= nil and model:FindFirstChildOfClass("Humanoid") ~= nil
+end
+
+local function wallbangFactory(name, orig)
+	return function(...)
+		local r = orig(...)
+		if not Wallbang.enabled then
+			return r
+		end
+		if typeof(r) == "RaycastResult" then
+			local inst = r.Instance
+			if inst and not isCharacterInstance(inst) then
+				return nil
+			end
+		end
+		return r
+	end
+end
+
+function Wallbang.install()
+	if type(hookfn) ~= "function" then
+		return 0
+	end
+	if Wallbang.installed then
+		return Wallbang.hooked
+	end
+	Wallbang.installed = true
+	local total = 0
+	for _, mod in ipairs({ G.raycast, G.bullet, G.weapon }) do
+		if type(mod) == "table" then
+			for key, value in pairs(mod) do
+				if type(value) == "function" then
+					local ok, orig = pcall(hookfn, value, wallbangFactory(key, value))
+					if ok and type(orig) == "function" then
+						total += 1
+						addRestore(function()
+							pcall(hookfn, value, orig)
+						end)
+					end
+				end
+			end
+		end
+	end
+	Wallbang.hooked = total
+	return total
+end
+
+--=============================================================
+-- input
+--=============================================================
+local keyHeld = {}
+
+UserInput.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.Keyboard then
+		keyHeld[input.KeyCode.Name] = true
+	end
+end)
+
+UserInput.InputEnded:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.Keyboard then
+		keyHeld[input.KeyCode.Name] = nil
+	end
+end)
+
+local function clicked()
+	if type(mouse1click) == "function" then
+		pcall(mouse1click)
+		return
+	end
+	local vu = rawget(getfenv(), "VirtualUser")
+	if vu then
+		pcall(function()
+			vu:ClickButton1(Vector2.new())
+		end)
+	end
+end
+
+--=============================================================
+-- aimbot / triggerbot
+--=============================================================
+local Aim = {
+	current = nil,
+	lastShot = 0,
+	spread = 0,
+}
+
+local function viewportCenter()
+	local camera = cam()
+	if not camera then
+		return Vector2.zero
+	end
+	local size = camera.ViewportSize
+	return Vector2.new(size.X / 2, size.Y / 2)
+end
+
+function Aim.wantsActive()
+	if not Flags.aim then
+		return false
+	end
+	if Flags.aimKey and not keyHeld[Flags.aimKey] then
+		return false
+	end
+	local char = selfChar()
+	if not char or not alive(char) then
+		return false
+	end
+	if inBuyPeriod() then
+		return false
+	end
+	return true
+end
+
+function Aim.pick()
+	local camera = cam()
+	if not camera then
+		return nil
+	end
+	local center = viewportCenter()
+	local best, bestDist = nil, math.huge
+	for _, t in ipairs(Targets.list()) do
+		local part = hitPart(t.model, Flags.aimHitPart)
+		if part then
+			local sp, onScreen = camera:WorldToViewportPoint(part.Position)
+			if onScreen then
+				local d = (Vector2.new(sp.X, sp.Y) - center).Magnitude
+				if d <= Flags.aimFov and d < bestDist then
+					if lineOfSight(part, t.model) then
+						best, bestDist = { target = t, part = part, dist = d }, d
+					end
+				end
+			end
+		end
+	end
+	return best
+end
+
+function Aim.step()
+	local camera = cam()
+	if not camera then
+		return
+	end
+	local pick = Aim.wantsActive() and Aim.pick() or nil
+	Aim.current = pick
+	if not pick then
+		return
+	end
+	local part = pick.part
+	local aimPos = part.Position
+	local pred = Flags.aimPrediction
+	if pred > 0 then
+		aimPos = aimPos + velocityOf(pick.target.model, part) * pred
+	end
+	local origin = camera.CFrame.Position
+	local desired = CFrame.lookAt(origin, aimPos)
+	local smooth = Flags.aimSmooth
+	if smooth <= 1 then
+		camera.CFrame = desired
+	else
+		local alpha = clamp(1 / (smooth * 0.55), 0.02, 1)
+		camera.CFrame = camera.CFrame:Lerp(desired, alpha)
+	end
+end
+
+local lastTrigger = 0
+
+function Aim.trigger()
+	if not Flags.trigger then
+		return
+	end
+	if UserInput:GetFocusedTextBox() then
+		return
+	end
+	local now = os.clock()
+	if now - lastTrigger < Flags.triggerDelay then
+		return
+	end
+	local char = selfChar()
+	if not char or not alive(char) or inBuyPeriod() then
+		return
+	end
+	local camera = cam()
+	if not camera then
+		return
+	end
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = characterParts()
+	params.IgnoreWater = true
+	local origin = camera.CFrame.Position
+	local dir = camera.CFrame.LookVector * 500
+	local hit = Workspace:Raycast(origin, dir, params)
+	if not hit or not hit.Instance then
+		return
+	end
+	if not isCharacterInstance(hit.Instance) then
+		return
+	end
+	local model = hit.Instance:FindFirstAncestorOfClass("Model")
+	if not model or not alive(model) then
+		return
+	end
+	local sp = camera:WorldToViewportPoint(hit.Position)
+	if typeof(sp) ~= "Vector3" then
+		return
+	end
+	local d = (Vector2.new(sp.X, sp.Y) - viewportCenter()).Magnitude
+	if d > Flags.triggerFov then
+		return
+	end
+	lastTrigger = now
+	clicked()
+end
+
+--=============================================================
+-- movement
+--=============================================================
+local Move = { original = nil }
+
+function Move.step()
+	local char = selfChar()
+	if not char then
+		return
+	end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	if not hum then
+		return
+	end
+	if Flags.bhop then
+		if UserInput:IsKeyDown(Enum.KeyCode.Space) and hum.FloorMaterial ~= Enum.Material.Air then
+			hum:ChangeState(Enum.HumanoidStateType.Jumping)
+		end
+	end
+	if Flags.speed then
+		if Move.original == nil then
+			Move.original = hum.WalkSpeed
+		end
+		if hum.WalkSpeed ~= Flags.speedValue then
+			hum.WalkSpeed = Flags.speedValue
+		end
+	elseif Move.original then
+		if hum.WalkSpeed == Flags.speedValue then
+			hum.WalkSpeed = Move.original
+		end
+		Move.original = nil
+	end
+end
+
+-- anti-aim: yaw/pitch offset applied to the reported camera basis
+local function antiAimOffset()
+	if not Flags.antiaim then
+		return CFrame.new()
+	end
+	local t = os.clock()
+	local yaw = math.rad(Flags.aaYaw) * math.sin(t * 17)
+	local pitch = math.rad(Flags.aaPitch) * math.cos(t * 13)
+	return CFrame.Angles(pitch, yaw, 0)
+end
+
+--=============================================================
+-- ESP
+--=============================================================
+local ESP = {
+	enabled = false,
+	gui = nil,
+	entries = setmetatable({}, { __mode = "k" }),
+	active = {},
+}
+
+local function parentGui(gui)
+	local ok = pcall(function()
+		gui.Parent = CoreGui
+	end)
+	if not ok or not gui.Parent then
+		local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+		if pg then
+			pcall(function()
+				gui.Parent = pg
+			end)
+		end
+	end
+end
+
+function ESP.init()
+	if ESP.gui then
+		return ESP.gui
+	end
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "PenaToolkit"
+	gui.ResetOnSpawn = false
+	gui.IgnoreGuiInset = true
+	gui.DisplayOrder = 50
+	parentGui(gui)
+	ESP.gui = gui
+	return gui
+end
+
+local function makeEntry()
+	local gui = ESP.init()
+	local box = Instance.new("Frame")
+	box.Name = "box"
+	box.BackgroundTransparency = 1
+	box.BorderSizePixel = 0
+	box.Visible = false
+	box.Parent = gui
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = Color3.fromRGB(200, 148, 232)
+	stroke.Thickness = 1
+	stroke.Transparency = 0.15
+	stroke.Parent = box
+
+	local fill = Instance.new("Frame")
+	fill.Name = "health"
+	fill.BackgroundColor3 = Color3.fromRGB(128, 214, 156)
+	fill.BorderSizePixel = 0
+	fill.AnchorPoint = Vector2.new(0, 1)
+	fill.Position = UDim2.fromScale(0, 1)
+	fill.Parent = box
+
+	local name = Instance.new("TextLabel")
+	name.Name = "name"
+	name.BackgroundTransparency = 1
+	name.Font = Enum.Font.GothamMedium
+	name.TextSize = 12
+	name.TextColor3 = Color3.fromRGB(235, 235, 240)
+	name.TextXAlignment = Enum.TextXAlignment.Left
+	name.Parent = gui
+
+	local dist = Instance.new("TextLabel")
+	dist.Name = "dist"
+	dist.BackgroundTransparency = 1
+	dist.Font = Enum.Font.Gotham
+	dist.TextSize = 11
+	dist.TextColor3 = Color3.fromRGB(170, 170, 178)
+	dist.TextXAlignment = Enum.TextXAlignment.Left
+	dist.Parent = gui
+
+	return { box = box, stroke = stroke, fill = fill, name = name, dist = dist }
+end
+
+local function entryFor(model)
+	local e = ESP.entries[model]
+	if not e then
+		e = makeEntry()
+		ESP.entries[model] = e
+	end
+	return e
+end
+
+function ESP.hide(entry)
+	if entry.box.Parent then
+		entry.box.Visible = false
+	end
+	entry.name.Visible = false
+	entry.dist.Visible = false
+end
+
+function ESP.step()
+	if not ESP.gui then
+		return
+	end
+	local camera = cam()
+	if not camera then
+		return
+	end
+	local alive_set = {}
+	if Flags.esp then
+		local camPos = camera.CFrame.Position
+		for _, t in ipairs(Targets.list()) do
+			local model = t.model
+			local root = rootOf(model)
+			local head = model:FindFirstChild("Head")
+			if root and head then
+				local dist = (root.Position - camPos).Magnitude
+				if dist <= Flags.espMaxDist then
+					local e = entryFor(model)
+					local top, topOn = camera:WorldToViewportPoint(head.Position + Vector3.new(0, 0.7, 0))
+					local bottom, botOn = camera:WorldToViewportPoint(root.Position - Vector3.new(0, 2.9, 0))
+					if topOn and botOn then
+						local height = math.abs(bottom.Y - top.Y)
+						local width = height * 0.52
+						if height > 4 and height < 2000 then
+							alive_set[model] = true
+							e.box.Visible = Flags.espBox
+							e.box.Position = UDim2.fromOffset(top.X - width / 2, top.Y)
+							e.box.Size = UDim2.fromOffset(width, height)
+							e.name.Visible = Flags.espName
+							e.name.Text = t.name
+							e.name.Position = UDim2.fromOffset(top.X - width / 2, top.Y - 16)
+							e.dist.Visible = Flags.espDistance
+							e.dist.Text = string.format("%dm", round(dist / 3))
+							e.dist.Position = UDim2.fromOffset(top.X - width / 2, top.Y + height + 2)
+							if Flags.espHealth then
+								local hp = model:GetAttribute("Health")
+								if type(hp) ~= "number" then
+									local hum = model:FindFirstChildOfClass("Humanoid")
+									hp = hum and hum.Health or 100
+								end
+								local frac = clamp(hp / 100, 0, 1)
+								e.fill.Visible = true
+								e.fill.Size = UDim2.new(0, 2, frac, 0)
+								e.fill.BackgroundColor3 = Color3.fromRGB(
+									round(112 + (255 - 112) * (1 - frac)),
+									round(214 + (112 - 214) * (1 - frac)),
+									round(156 + (118 - 156) * (1 - frac))
+								)
+							else
+								e.fill.Visible = false
+							end
+						else
+							ESP.hide(e)
+						end
+					else
+						ESP.hide(e)
+					end
+				elseif ESP.entries[model] then
+					ESP.hide(ESP.entries[model])
+				end
+			end
+		end
+	end
+	for model, e in pairs(ESP.entries) do
+		if not alive_set[model] then
+			ESP.hide(e)
+		end
+		if not model.Parent then
+			e.box:Destroy()
+			e.name:Destroy()
+			e.dist:Destroy()
+			ESP.entries[model] = nil
+		end
+	end
+end
+
+-- fov ring + hit log overlay
+local HUD = { ring = nil, log = nil, lines = {} }
+
+function HUD.init()
+	local gui = ESP.init()
+	local ring = Instance.new("Frame")
+	ring.Name = "fov"
+	ring.BackgroundTransparency = 1
+	ring.AnchorPoint = Vector2.new(0.5, 0.5)
+	ring.Visible = false
+	ring.Parent = gui
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0.5, 0)
+	corner.Parent = ring
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = Color3.fromRGB(200, 148, 232)
+	stroke.Thickness = 1
+	stroke.Transparency = 0.45
+	stroke.Parent = ring
+	HUD.ring = ring
+
+	local log = Instance.new("TextLabel")
+	log.Name = "log"
+	log.BackgroundTransparency = 1
+	log.Font = Enum.Font.GothamMedium
+	log.TextSize = 13
+	log.TextXAlignment = Enum.TextXAlignment.Left
+	log.TextYAlignment = Enum.TextYAlignment.Bottom
+	log.TextColor3 = Color3.fromRGB(230, 230, 236)
+	log.Text = ""
+	log.AnchorPoint = Vector2.new(0, 1)
+	log.Position = UDim2.new(0, 14, 1, -14)
+	log.Size = UDim2.new(0, 320, 0, 90)
+	log.Parent = gui
+	HUD.log = log
+end
+
+function HUD.push(text)
+	table.insert(HUD.lines, 1, text)
+	while #HUD.lines > 4 do
+		table.remove(HUD.lines)
+	end
+	if HUD.log then
+		HUD.log.Text = table.concat(HUD.lines, "\n")
+	end
+end
+
+function HUD.step()
+	if not HUD.ring then
+		return
+	end
+	local show = Flags.showFov
+	HUD.ring.Visible = show
+	if show then
+		local d = Flags.aimFov * 2
+		HUD.ring.Size = UDim2.fromOffset(d, d)
+		HUD.ring.Position = UDim2.fromScale(0.5, 0.5)
+	end
+	if HUD.log then
+		HUD.log.Visible = Flags.showLogs
+	end
+end
+
+--=============================================================
+-- UI framework
+--=============================================================
+local Theme = {
+	bg     = Color3.fromRGB(11, 11, 14),
+	card   = Color3.fromRGB(18, 18, 23),
+	row    = Color3.fromRGB(23, 23, 29),
+	acc    = Color3.fromRGB(200, 148, 232),
+	txt    = Color3.fromRGB(232, 232, 238),
+	sub    = Color3.fromRGB(150, 150, 160),
+	faint  = Color3.fromRGB(74, 74, 84),
+}
+
+local UI = {
+	root = nil,
+	main = nil,
+	content = nil,
+	tabs = {},
+	active = nil,
+	controls = {},
+	building = false,
+}
+
+local function mk(class, props, parent)
+	local inst = Instance.new(class)
+	for key, value in pairs(props or {}) do
+		inst[key] = value
+	end
+	if parent then
+		inst.Parent = parent
+	end
+	return inst
+end
+
+local function corner(inst, radius)
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, radius or 6)
+	c.Parent = inst
+	return c
+end
+
+local function stroke(inst, color, transparency, thickness)
+	local s = Instance.new("UIStroke")
+	s.Color = color or Theme.faint
+	s.Transparency = transparency or 0.4
+	s.Thickness = thickness or 1
+	s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+	s.Parent = inst
+	return s
+end
+
+local function padding(inst, l, r, t, b)
+	local p = Instance.new("UIPadding")
+	p.PaddingLeft = UDim.new(0, l or 0)
+	p.PaddingRight = UDim.new(0, r or 0)
+	p.PaddingTop = UDim.new(0, t or 0)
+	p.PaddingBottom = UDim.new(0, b or 0)
+	p.Parent = inst
+	return p
+end
+
+local function list(inst, gap)
+	local l = Instance.new("UIListLayout")
+	l.SortOrder = Enum.SortOrder.LayoutOrder
+	l.Padding = UDim.new(0, gap or 6)
+	l.Parent = inst
+	return l
+end
+
+local function makeDraggable(frame, handle)
+	local dragging = false
+	local startPos, startInput
+	handle.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 then
+			dragging = true
+			startPos = frame.Position
+			startInput = input.Position
+		end
+	end)
+	UserInput.InputChanged:Connect(function(input)
+		if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+			local delta = input.Position - startInput
+			frame.Position = UDim2.new(
+				startPos.X.Scale, startPos.X.Offset + delta.X,
+				startPos.Y.Scale, startPos.Y.Offset + delta.Y
+			)
+		end
+	end)
+	UserInput.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 then
+			dragging = false
+		end
+	end)
+end
+
+function UI.tab(name)
+	local holder = UI.tabs[name]
+	if not holder then
+		return nil
+	end
+	return holder.page
+end
+
+local function section(page, text)
+	local label = mk("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 22),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamBold,
+		TextSize = 11,
+		Text = string.upper(text),
+		TextColor3 = Theme.faint,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Parent = page,
+	}, page)
+	return label
+end
+
+local function rowFrame(page, height)
+	return mk("Frame", {
+		Size = UDim2.new(1, 0, 0, height or 30),
+		BackgroundColor3 = Theme.row,
+		Parent = page,
+	})
+end
+
+local function toggle(page, label, flag, onChange)
+	local row = rowFrame(page, 30)
+	corner(row, 6)
+	mk("TextLabel", {
+		Position = UDim2.fromOffset(10, 0),
+		Size = UDim2.new(1, -60, 1, 0),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamMedium,
+		TextSize = 13,
+		Text = label,
+		TextColor3 = Theme.txt,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Parent = row,
+	}, row)
+
+	local pill = mk("Frame", {
+		Position = UDim2.new(1, -42, 0.5, -8),
+		Size = UDim2.fromOffset(32, 16),
+		BackgroundColor3 = Theme.faint,
+		Parent = row,
+	}, row)
+	corner(pill, 8)
+
+	local knob = mk("Frame", {
+		Position = UDim2.fromOffset(2, 2),
+		Size = UDim2.fromOffset(12, 12),
+		BackgroundColor3 = Theme.txt,
+		Parent = pill,
+	}, pill)
+	corner(knob, 6)
+
+	local btn = mk("TextButton", {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		Text = "",
+		Parent = row,
+	}, row)
+
+	local function render()
+		local on = Flags[flag] and true or false
+		TweenService:Create(pill, TweenInfo.new(0.14), {
+			BackgroundColor3 = on and Theme.acc or Theme.faint,
+		}):Play()
+		TweenService:Create(knob, TweenInfo.new(0.14), {
+			Position = on and UDim2.fromOffset(18, 2) or UDim2.fromOffset(2, 2),
+		}):Play()
+	end
+
+	btn.MouseButton1Click:Connect(function()
+		Flags[flag] = not Flags[flag]
+		render()
+		if onChange then
+			onChange(Flags[flag])
+		end
+	end)
+	render()
+
+	UI.controls[flag] = { render = render, kind = "toggle" }
+	return row
+end
+
+local function slider(page, label, flag, min, max, step, suffix)
+	local row = rowFrame(page, 40)
+	corner(row, 6)
+
+	local text = mk("TextLabel", {
+		Position = UDim2.fromOffset(10, 3),
+		Size = UDim2.new(1, -70, 0, 16),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamMedium,
+		TextSize = 13,
+		Text = label,
+		TextColor3 = Theme.txt,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Parent = row,
+	}, row)
+
+	local value = mk("TextLabel", {
+		Position = UDim2.new(1, -70, 0, 3),
+		Size = UDim2.fromOffset(60, 16),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamMedium,
+		TextSize = 12,
+		Text = tostring(Flags[flag]),
+		TextColor3 = Theme.acc,
+		TextXAlignment = Enum.TextXAlignment.Right,
+		Parent = row,
+	}, row)
+
+	local track = mk("Frame", {
+		Position = UDim2.new(0, 10, 0, 26),
+		Size = UDim2.new(1, -20, 0, 4),
+		BackgroundColor3 = Theme.bg,
+		Parent = row,
+	}, row)
+	corner(track, 2)
+
+	local fill = mk("Frame", {
+		Size = UDim2.fromScale(0, 1),
+		BackgroundColor3 = Theme.acc,
+		Parent = track,
+	}, track)
+	corner(fill, 2)
+
+	local dragging = false
+
+	local function render()
+		local v = tonumber(Flags[flag]) or min
+		local frac = clamp((v - min) / (max - min == 0 and 1 or max - min), 0, 1)
+		fill.Size = UDim2.fromScale(frac, 1)
+		value.Text = tostring(v) .. (suffix or "")
+	end
+
+	local function apply(px)
+		local box = track.AbsoluteSize.X
+		if box <= 0 then
+			return
+		end
+		local frac = clamp(px / box, 0, 1)
+		local raw = min + frac * (max - min)
+		if step and step > 0 then
+			raw = math.floor(raw / step + 0.5) * step
+		end
+		Flags[flag] = clamp(raw, min, max)
+		render()
+	end
+
+	track.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 then
+			dragging = true
+			apply(input.Position.X - track.AbsolutePosition.X)
+		end
+	end)
+	UserInput.InputChanged:Connect(function(input)
+		if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+			apply(input.Position.X - track.AbsolutePosition.X)
+		end
+	end)
+	UserInput.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 then
+			dragging = false
+		end
+	end)
+
+	render()
+	UI.controls[flag] = { render = render, kind = "slider" }
+	return row
+end
+
+local function button(page, label, callback)
+	local row = rowFrame(page, 30)
+	corner(row, 6)
+	local btn = mk("TextButton", {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamMedium,
+		TextSize = 13,
+		Text = label,
+		TextColor3 = Theme.txt,
+		TextXAlignment = Enum.TextXAlignment.Center,
+		Parent = row,
+	}, row)
+	btn.MouseEnter:Connect(function()
+		btn.TextColor3 = Theme.acc
+	end)
+	btn.MouseLeave:Connect(function()
+		btn.TextColor3 = Theme.txt
+	end)
+	btn.MouseButton1Click:Connect(function()
+		local ok, err = pcall(callback)
+		if not ok then
+			HUD.push("error: " .. tostring(err))
+		end
+	end)
+	return row
+end
+
+local function keybind(page, label, flag)
+	local row = rowFrame(page, 30)
+	corner(row, 6)
+	mk("TextLabel", {
+		Position = UDim2.fromOffset(10, 0),
+		Size = UDim2.new(1, -110, 1, 0),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamMedium,
+		TextSize = 13,
+		Text = label,
+		TextColor3 = Theme.txt,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Parent = row,
+	}, row)
+	local btn = mk("TextButton", {
+		Position = UDim2.new(1, -100, 0, 5),
+		Size = UDim2.fromOffset(92, 20),
+		BackgroundColor3 = Theme.bg,
+		Font = Enum.Font.GothamMedium,
+		TextSize = 12,
+		TextColor3 = Theme.acc,
+		Text = Flags[flag] or "none",
+		Parent = row,
+	}, row)
+	corner(btn, 4)
+	stroke(btn, Theme.faint, 0.5, 1)
+	local capturing = false
+	local function render()
+		btn.Text = Flags[flag] or "none"
+	end
+	btn.MouseButton1Click:Connect(function()
+		capturing = true
+		btn.Text = "..."
+	end)
+	UserInput.InputBegan:Connect(function(input)
+		if not capturing then
+			return
+		end
+		if input.UserInputType ~= Enum.UserInputType.Keyboard then
+			return
+		end
+		capturing = false
+		local key = input.KeyCode.Name
+		if key == "Escape" or key == "Backspace" or key == "Unknown" then
+			Flags[flag] = nil
+		else
+			Flags[flag] = key
+		end
+		render()
+	end)
+	UI.controls[flag] = { render = render, kind = "bind" }
+	return row
+end
+
+local function buildWindow()
+	local gui = mk("ScreenGui", {
+		Name = "PenaMenu",
+		ResetOnSpawn = false,
+		IgnoreGuiInset = true,
+		DisplayOrder = 100,
+	}, nil)
+	parentGui(gui)
+	UI.root = gui
+
+	local main = mk("Frame", {
+		Size = UDim2.fromOffset(420, 430),
+		Position = UDim2.new(0.5, -210, 0.5, -215),
+		BackgroundColor3 = Theme.bg,
+		BorderSizePixel = 0,
+		Parent = gui,
+	})
+	corner(main, 10)
+	stroke(main, Theme.acc, 0.82, 1)
+	UI.main = main
+
+	local bar = mk("Frame", {
+		Size = UDim2.new(1, 0, 0, 34),
+		BackgroundColor3 = Theme.card,
+		Parent = main,
+	}, main)
+	corner(bar, 10)
+	mk("Frame", {
+		Size = UDim2.new(1, 0, 0, 12),
+		Position = UDim2.new(0, 0, 1, -12),
+		BackgroundColor3 = Theme.card,
+		Parent = bar,
+	}, bar)
+
+	mk("TextLabel", {
+		Position = UDim2.fromOffset(12, 0),
+		Size = UDim2.new(1, -60, 1, 0),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamBold,
+		TextSize = 13,
+		Text = "penablox recode",
+		TextColor3 = Theme.txt,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Parent = bar,
+	}, bar)
+
+	mk("TextLabel", {
+		Position = UDim2.fromOffset(150, 0),
+		Size = UDim2.new(1, -200, 1, 0),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.Gotham,
+		TextSize = 11,
+		Text = "insert",
+		TextColor3 = Theme.faint,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Parent = bar,
+	}, bar)
+
+	local close = mk("TextButton", {
+		Position = UDim2.new(1, -28, 0, 7),
+		Size = UDim2.fromOffset(20, 20),
+		BackgroundColor3 = Theme.row,
+		Font = Enum.Font.GothamBold,
+		TextSize = 12,
+		Text = "x",
+		TextColor3 = Theme.sub,
+		Parent = bar,
+	}, bar)
+	corner(close, 4)
+	close.MouseButton1Click:Connect(function()
+		main.Visible = false
+	end)
+
+	makeDraggable(main, bar)
+
+	local strip = mk("Frame", {
+		Position = UDim2.fromOffset(8, 42),
+		Size = UDim2.fromOffset(104, 380),
+		BackgroundTransparency = 1,
+		Parent = main,
+	}, main)
+	list(strip, 4)
+
+	local content = mk("ScrollingFrame", {
+		Position = UDim2.fromOffset(120, 42),
+		Size = UDim2.fromOffset(292, 380),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		ScrollBarThickness = 2,
+		ScrollBarImageColor3 = Theme.faint,
+		CanvasSize = UDim2.new(0, 0, 0, 0),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		ScrollBarImageTransparency = 0.3,
+		Parent = main,
+	}, main)
+	list(content, 6)
+	padding(content, 2, 8, 2, 10)
+	UI.content = content
+
+	local order = 0
+	local function addTab(name, label)
+		order += 1
+		local holder = mk("TextButton", {
+			Size = UDim2.new(1, 0, 0, 30),
+			BackgroundColor3 = Theme.row,
+			Font = Enum.Font.GothamMedium,
+			TextSize = 13,
+			Text = label,
+			TextColor3 = Theme.sub,
+			LayoutOrder = order,
+			Parent = strip,
+		}, strip)
+		corner(holder, 6)
+
+		local page = mk("Frame", {
+			Size = UDim2.new(1, 0, 0, 0),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			BackgroundTransparency = 1,
+			Visible = false,
+			Parent = content,
+		}, content)
+		list(page, 6)
+
+		UI.tabs[name] = { page = page, button = holder }
+
+		holder.MouseButton1Click:Connect(function()
+			UI.select(name)
+		end)
+	end
+
+	UI.select = function(name)
+		for key, holder in pairs(UI.tabs) do
+			local isActive = key == name
+			holder.page.Visible = isActive
+			holder.button.TextColor3 = isActive and Theme.acc or Theme.sub
+			TweenService:Create(holder.button, TweenInfo.new(0.12), {
+				BackgroundColor3 = isActive and Theme.card or Theme.row,
+			}):Play()
+		end
+		UI.active = name
+	end
+
+	addTab("aim", "aim")
+	addTab("visuals", "visuals")
+	addTab("misc", "misc")
+	addTab("config", "config")
+	UI.select("aim")
+
+	return gui
+end
+
+--=============================================================
+-- config persistence
+--=============================================================
+local CFG_DIR = "penablox_recode"
+local CFG_FILE = CFG_DIR .. "/config.json"
+
+local function ensureFolder()
+	if type(isfolder_) == "function" and type(makefolder_) == "function" then
+		local ok, exists = pcall(isfolder_, CFG_DIR)
+		if ok and not exists then
+			pcall(makefolder_, CFG_DIR)
+		end
+	end
+end
+
+local function saveConfig()
+	if type(writefile_) ~= "function" then
+		return false, "no filesystem"
+	end
+	ensureFolder()
+	local payload = {}
+	for key, value in pairs(Flags) do
+		if type(value) == "boolean" or type(value) == "number" or type(value) == "string" then
+			payload[key] = value
+		end
+	end
+	local ok, encoded = pcall(function()
+		return HttpService:JSONEncode({ flags = payload })
+	end)
+	if not ok then
+		return false, "encode failed"
+	end
+	local wrote = pcall(writefile_, CFG_FILE, encoded)
+	if not wrote then
+		return false, "write failed"
+	end
+	return true
+end
+
+local function loadConfig()
+	if type(readfile_) ~= "function" or type(isfile_) ~= "function" then
+		return false, "no filesystem"
+	end
+	local ok, exists = pcall(isfile_, CFG_FILE)
+	if not ok or not exists then
+		return false, "no config"
+	end
+	local raw = try(readfile_, CFG_FILE)
+	if type(raw) ~= "string" or raw == "" then
+		return false, "empty"
+	end
+	local decoded = try(function()
+		return HttpService:JSONDecode(raw)
+	end)
+	if type(decoded) ~= "table" or type(decoded.flags) ~= "table" then
+		return false, "bad json"
+	end
+	for key, value in pairs(decoded.flags) do
+		if Flags[key] ~= nil or key == "aimKey" then
+			Flags[key] = value
+		end
+	end
+	for _, ctrl in pairs(UI.controls) do
+		if ctrl.render then
+			pcall(ctrl.render)
+		end
+	end
+	-- side-effecting flags need their hook state restored too
+	if Flags.nospread then
+		NoSpread.enable()
+	else
+		NoSpread.disable()
+	end
+	InfAmmo.enabled = Flags.infammo
+	Wallbang.enabled = Flags.wallbang
+	return true
+end
+
+--=============================================================
+-- menu content
+--=============================================================
+local function buildMenu()
+	buildWindow()
+
+	local aim = UI.tab("aim")
+	section(aim, "aimbot")
+	toggle(aim, "aimbot enabled", "aim")
+	keybind(aim, "hold key", "aimKey")
+	slider(aim, "fov", "aimFov", 10, 400, 1, "px")
+	slider(aim, "smooth", "aimSmooth", 1, 30, 1, "")
+	slider(aim, "prediction", "aimPrediction", 0, 0.4, 0.01, "s")
+	toggle(aim, "team check", "aimTeamCheck")
+	toggle(aim, "visible only", "aimVisible")
+
+	section(aim, "triggerbot")
+	toggle(aim, "triggerbot", "trigger")
+	slider(aim, "trigger fov", "triggerFov", 1, 60, 1, "px")
+	slider(aim, "delay", "triggerDelay", 0, 0.4, 0.01, "s")
+
+	section(aim, "hit part")
+	local parts = { "Head", "Torso", "Nearest" }
+	for _, name in ipairs(parts) do
+		button(aim, "> " .. name, function()
+			Flags.aimHitPart = name
+			HUD.push("hit part: " .. name)
+		end)
+	end
+
+	local visuals = UI.tab("visuals")
+	section(visuals, "players")
+	toggle(visuals, "esp", "esp")
+	toggle(visuals, "boxes", "espBox")
+	toggle(visuals, "names", "espName")
+	toggle(visuals, "health bar", "espHealth")
+	toggle(visuals, "distance", "espDistance")
+	slider(visuals, "render range", "espMaxDist", 100, 2000, 25, "st")
+
+	section(visuals, "hud")
+	toggle(visuals, "fov ring", "showFov")
+	toggle(visuals, "hit logs", "showLogs")
+
+	local misc = UI.tab("misc")
+	section(misc, "shooting")
+	toggle(misc, "no spread", "nospread", function(on)
+		if on then
+			if not NoSpread.enable() then
+				Flags.nospread = false
+				local ctrl = UI.controls.nospread
+				if ctrl and ctrl.render then
+					ctrl.render()
+				end
+				HUD.push("nospread: math.random unavailable")
+			end
+		else
+			NoSpread.disable()
+		end
+	end)
+	toggle(misc, "infinite ammo", "infammo", function(on)
+		InfAmmo.enabled = on
+		if on then
+			local n = InfAmmo.install()
+			if n == 0 then
+				HUD.push("ammo: no hookable members found")
+			end
+		end
+	end)
+	toggle(misc, "wallbang", "wallbang", function(on)
+		Wallbang.enabled = on
+		if on then
+			local n = Wallbang.install()
+			if n == 0 then
+				HUD.push("wallbang: no hookable ray members")
+			end
+		end
+	end)
+
+	section(misc, "movement")
+	toggle(misc, "bhop", "bhop")
+	toggle(misc, "walk speed", "speed")
+	slider(misc, "speed value", "speedValue", 8, 120, 1, "")
+	toggle(misc, "anti-aim jitter", "antiaim")
+	slider(misc, "aa yaw", "aaYaw", 0, 90, 1, "deg")
+	slider(misc, "aa pitch", "aaPitch", 0, 45, 1, "deg")
+
+	section(misc, "diagnostics")
+	button(misc, "dump module map", function()
+		HUD.push("modules:")
+		for name, present in pairs(G.ok) do
+			HUD.push((present and "+ " or "- ") .. name)
+		end
+	end)
+	button(misc, "hook ammo members (" .. tostring(InfAmmo.hooked) .. ")", function()
+		local n = InfAmmo.install()
+		HUD.push("ammo hooks: " .. tostring(n))
+	end)
+	button(misc, "install wallbang hooks (" .. tostring(#Restores) .. " total)", function()
+		Wallbang.install()
+		HUD.push("restores: " .. tostring(#Restores))
+	end)
+
+	local cfg = UI.tab("config")
+	section(cfg, "presets")
+	button(cfg, "save config", function()
+		local ok, err = saveConfig()
+		HUD.push(ok and "config saved" or ("save failed: " .. tostring(err)))
+	end)
+	button(cfg, "load config", function()
+		local ok, err = loadConfig()
+		HUD.push(ok and "config loaded" or ("load failed: " .. tostring(err)))
+	end)
+	section(cfg, "runtime")
+	button(cfg, "re-pick hit part", function()
+		Flags.aimHitPart = Flags.aimHitPart == "Head" and "Torso" or "Head"
+		HUD.push("hit part: " .. Flags.aimHitPart)
+	end)
+	button(cfg, "unload", function()
+		if _G.__pena_toolkit then
+			_G.__pena_toolkit.unload()
+		end
+	end)
+end
+
+--=============================================================
+-- main loop
+--=============================================================
+local aliveFlag = true
+local connections = {}
+local renderBinding = nil
+
+local function connect(signal, fn)
+	connections[#connections + 1] = signal:Connect(fn)
+end
+
+local function unload()
+	aliveFlag = false
+	if renderBinding then
+		pcall(function()
+			RunService:UnbindFromRenderStep(renderBinding)
+		end)
+		renderBinding = nil
+	end
+	for _, c in ipairs(connections) do
+		pcall(function()
+			c:Disconnect()
+		end)
+	end
+	connections = {}
+	for _, restore in ipairs(Restores) do
+		pcall(restore)
+	end
+	Restores = {}
+	NoSpread.disable()
+	if ESP.gui then
+		pcall(function()
+			ESP.gui:Destroy()
+		end)
+	end
+	if UI.root then
+		pcall(function()
+			UI.root:Destroy()
+		end)
+	end
+	_G.__pena_toolkit = nil
+end
+
+buildMenu()
+ESP.init()
+HUD.init()
+
+local function renderStep()
+	if not aliveFlag then
+		return
+	end
+	-- camera writes happen at Camera priority + 50 so the game's controller
+	-- has already run for this frame and we win the final say
+	Aim.step()
+	if Flags.antiaim and not Aim.wantsActive() then
+		local camera = cam()
+		if camera then
+			local pos = camera.CFrame.Position
+			local jittered = camera.CFrame * antiAimOffset()
+			camera.CFrame = CFrame.lookAt(pos, pos + jittered.LookVector)
+		end
+	end
+	ESP.step()
+	HUD.step()
+end
+
+local bindName = "pena_toolkit_render"
+local bound = pcall(function()
+	RunService:BindToRenderStep(bindName, Enum.RenderPriority.Camera.Value + 50, renderStep)
+end)
+if bound then
+	renderBinding = bindName
+else
+	connect(RunService.RenderStepped, renderStep)
+end
+
+connect(RunService.Heartbeat, function()
+	if not aliveFlag then
+		return
+	end
+	Move.step()
+	Aim.trigger()
+end)
+
+connect(UserInput.InputBegan, function(input)
+	if input.KeyCode == Enum.KeyCode.Insert then
+		if UI.main then
+			UI.main.Visible = not UI.main.Visible
+		end
+	end
+end)
+
+-- binds capture keyboard only; the mouse stays reserved for shooting
+_G.__pena_toolkit = {
+	flags = Flags,
+	modules = G,
+	targets = Targets,
+	unload = unload,
+	save = saveConfig,
+	load = loadConfig,
+}
+
+HUD.push("toolkit ready - insert")
+for name, present in pairs(G.ok) do
+	if not present then
+		HUD.push("missing module: " .. name)
+	end
+end
